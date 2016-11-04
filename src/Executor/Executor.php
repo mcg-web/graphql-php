@@ -10,6 +10,7 @@ use GraphQL\Language\AST\Node;
 use GraphQL\Language\AST\NodeKind;
 use GraphQL\Language\AST\OperationDefinitionNode;
 use GraphQL\Language\AST\SelectionSetNode;
+use GraphQL\Promise\PromiseInterface;
 use GraphQL\Schema;
 use GraphQL\Type\Definition\AbstractType;
 use GraphQL\Type\Definition\Directive;
@@ -169,10 +170,13 @@ class Executor
 
         $path = [];
         if ($operation->operation === 'mutation') {
-            return self::executeFieldsSerially($exeContext, $type, $rootValue, $path, $fields);
+            $results = self::executeFieldsSerially($exeContext, $type, $rootValue, $path, $fields);
+        } else {
+            $results = self::executeFields($exeContext, $type, $rootValue, $path, $fields);
         }
+        $finalResults = self::completePromiseIfNeeded($results);
 
-        return self::executeFields($exeContext, $type, $rootValue, $path, $fields);
+        return $finalResults;
     }
 
 
@@ -221,15 +225,34 @@ class Executor
      */
     private static function executeFieldsSerially(ExecutionContext $exeContext, ObjectType $parentType, $sourceValue, $path, $fields)
     {
+        if (self::isThenable($sourceValue)) {
+            return $sourceValue->then(function($resolvedSourceValue) use ($exeContext, $parentType, $path, $fields) {
+                return self::executeFieldsSerially($exeContext, $parentType, $resolvedSourceValue, $path, $fields);
+            });
+        }
+
         $results = [];
-        foreach ($fields as $responseName => $fieldNodes) {
+
+        $process = function ($responseName, $fieldNodes, $results) use ($path, $exeContext, $parentType, $sourceValue) {
             $fieldPath = $path;
             $fieldPath[] = $responseName;
             $result = self::resolveField($exeContext, $parentType, $sourceValue, $fieldNodes, $fieldPath);
 
-            if ($result !== self::$UNDEFINED) {
-                // Undefined means that field is not defined in schema
-                $results[$responseName] = $result;
+            // Undefined means that field is not defined in schema
+            if ($result === self::$UNDEFINED) {
+                return $results;
+            }
+            $results[$responseName] = $result;
+            return $results;
+        };
+
+        foreach ($fields as $responseName => $fieldNodes) {
+            if (self::isThenable($results)) {
+                $results = $results->then(function ($resolvedResults) use ($responseName, $fieldNodes, $process) {
+                    return $process($responseName, $fieldNodes, $resolvedResults);
+                });
+            } else {
+                $results = $process($responseName, $fieldNodes, $results);
             }
         }
         // see #59
@@ -245,11 +268,8 @@ class Executor
      */
     private static function executeFields(ExecutionContext $exeContext, ObjectType $parentType, $source, $path, $fields)
     {
-        // Native PHP doesn't support promises.
-        // Custom executor should be built for platforms like ReactPHP
         return self::executeFieldsSerially($exeContext, $parentType, $source, $path, $fields);
     }
-
 
     /**
      * Given a selectionSet, adds all of the fields in that selection to
@@ -529,7 +549,7 @@ class Executor
         // Otherwise, error protection is applied, logging the error and resolving
         // a null value for this field if one is encountered.
         try {
-            return self::completeValueWithLocatedError(
+            $completed = self::completeValueWithLocatedError(
                 $exeContext,
                 $returnType,
                 $fieldNodes,
@@ -537,6 +557,18 @@ class Executor
                 $path,
                 $result
             );
+            if (self::isThenable($completed)) {
+                // If `completeValueWithLocatedError` returned a rejected promise, log
+                // the rejection error and resolve to null.
+                // Note: we don't rely on a `catch` method, but we do expect "thenable"
+                // to take a second callback for the error case.
+                return $completed->then(null, function ($err) use ($exeContext) {
+                    $exeContext->addError($err);
+                    return null;
+                });
+            }
+
+            return $completed;
         } catch (Error $err) {
             // If `completeValueWithLocatedError` returned abruptly (threw an error), log the error
             // and return null.
@@ -544,7 +576,6 @@ class Executor
             return null;
         }
     }
-
 
     /**
      * This is a small wrapper around completeValue which annotates errors with
@@ -559,7 +590,7 @@ class Executor
      * @return array|null
      * @throws Error
      */
-    static function completeValueWithLocatedError(
+    public static function completeValueWithLocatedError(
         ExecutionContext $exeContext,
         Type $returnType,
         $fieldNodes,
@@ -569,7 +600,7 @@ class Executor
     )
     {
         try {
-            return self::completeValue(
+            $completed = self::completeValue(
                 $exeContext,
                 $returnType,
                 $fieldNodes,
@@ -577,6 +608,12 @@ class Executor
                 $path,
                 $result
             );
+            if (self::isThenable($completed)) {
+                return $completed->then(null, function ($error) use ($fieldNodes, $path) {
+                    throw Error::createLocatedError($error, $fieldNodes, $path);
+                });
+            }
+            return $completed;
         } catch (\Exception $error) {
             throw Error::createLocatedError($error, $fieldNodes, $path);
         }
@@ -622,6 +659,20 @@ class Executor
         &$result
     )
     {
+        // If result is a Promise, apply-lift over completeValue.
+        if (self::isThenable($result)) {
+            return $result->then(function ($resolved) use ($exeContext, $returnType, $fieldNodes, $info, $path) {
+                return self::completeValue(
+                    $exeContext,
+                    $returnType,
+                    $fieldNodes,
+                    $info,
+                    $path,
+                    $resolved
+                );
+            });
+        }
+
         if ($result instanceof \Exception) {
             throw $result;
         }
@@ -891,6 +942,27 @@ class Executor
             }
         }
         return null;
+    }
+
+    private static function isThenable($value)
+    {
+        return ($value instanceof PromiseInterface);
+    }
+
+    private static function completePromiseIfNeeded($value)
+    {
+        if (self::isThenable($value)) {
+            $results = self::completePromiseIfNeeded($value->wait());
+            return $results;
+        } elseif (is_array($value) || $value instanceof \Traversable) {
+            $results = [];
+            foreach ($value as $key => $item) {
+                $results[$key] = self::completePromiseIfNeeded($item);
+            }
+            return $results;
+        }
+
+        return $value;
     }
 
     /**

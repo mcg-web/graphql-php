@@ -308,6 +308,8 @@ isTypeOf | `callback($value, $context, GraphQL\Type\Definition\ResolveInfo $info
 
 2. Object types are responsible for data fetching. Each of their fields may have optional `resolve` callback option. This callback takes `$value` that corresponds to instance of this type and returns `data` accepted by type of given field.
 If `resolve` option is not set, GraphQL will try to get `data` from `$value[$fieldName]`.
+`resolve` result can also be a promise implementing the interface `GraphQL\Promise\PromiseInterface`. If the result is a promise the executor will wait for 
+promise to complete before continuing.
 
 3. `resolve` callback is a place where you can use your existing data fetching logic. `$context` is defined by your application on the top level of query execution (useful for storing current user, environment details, etc)
 
