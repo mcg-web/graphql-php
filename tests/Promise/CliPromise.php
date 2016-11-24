@@ -36,6 +36,7 @@ class CliPromise
                 call_user_func($onRejected, $e);
             }
         }
+        return null;
     }
 
     private function isTerminated()

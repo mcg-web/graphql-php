@@ -10,7 +10,7 @@ use GraphQL\Language\AST\Node;
 use GraphQL\Language\AST\NodeKind;
 use GraphQL\Language\AST\OperationDefinitionNode;
 use GraphQL\Language\AST\SelectionSetNode;
-use GraphQL\Promise\PromiseInterface;
+use GraphQL\Promise\Promise;
 use GraphQL\Schema;
 use GraphQL\Type\Definition\AbstractType;
 use GraphQL\Type\Definition\Directive;
@@ -174,7 +174,7 @@ class Executor
         } else {
             $results = self::executeFields($exeContext, $type, $rootValue, $path, $fields);
         }
-        $finalResults = self::completePromiseIfNeeded($results);
+        $finalResults = Promise::completePromiseIfNeeded($results);
 
         return $finalResults;
     }
@@ -268,7 +268,40 @@ class Executor
      */
     private static function executeFields(ExecutionContext $exeContext, ObjectType $parentType, $source, $path, $fields)
     {
-        return self::executeFieldsSerially($exeContext, $parentType, $source, $path, $fields);
+        return Promise::all(self::executeFieldsSerially($exeContext, $parentType, $source, $path, $fields));
+
+        $containsPromise = false;
+        $results = [];
+        foreach ($fields as $responseName => $fieldNodes) {
+            $fieldPath = $path;
+            $fieldPath[] = $responseName;
+            $result = self::resolveField($exeContext, $parentType, $source, $fieldNodes, $fieldPath);
+
+            // Undefined means that field is not defined in schema
+            if ($result === self::$UNDEFINED) {
+                continue;
+            }
+            if (self::isThenable($result)) {
+                $containsPromise = true;
+            }
+            $results[$responseName] = $result;
+        }
+        $finalResults = $results;
+        // see #59
+        if ([] === $finalResults) {
+            $finalResults = new \stdClass();
+        }
+
+        // If there are no promises, we can just return the object
+        if (!$containsPromise) {
+            return $finalResults;
+        }
+
+        // Otherwise, results is a map from field name to the result
+        // of resolving that field, which is possibly a promise. Return
+        // a promise that will return this same map, but with any
+        // promises replaced with the values they resolved to.
+        return Promise::all($finalResults);
     }
 
     /**
@@ -946,23 +979,7 @@ class Executor
 
     private static function isThenable($value)
     {
-        return ($value instanceof PromiseInterface);
-    }
-
-    private static function completePromiseIfNeeded($value)
-    {
-        if (self::isThenable($value)) {
-            $results = self::completePromiseIfNeeded($value->wait());
-            return $results;
-        } elseif (is_array($value) || $value instanceof \Traversable) {
-            $results = [];
-            foreach ($value as $key => $item) {
-                $results[$key] = self::completePromiseIfNeeded($item);
-            }
-            return $results;
-        }
-
-        return $value;
+        return Promise::isThenable($value);
     }
 
     /**

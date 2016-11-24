@@ -7,7 +7,6 @@ interface PromiseInterface
      * Waits until the promise completes if possible.
      *
      * @return mixed
-     * @throws \LogicException if the promise has no wait function.
      */
     public function wait();
 

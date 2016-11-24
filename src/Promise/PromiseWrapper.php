@@ -16,6 +16,7 @@ class PromiseWrapper implements PromiseInterface
             $this->setWrappedPromise($promise);
         }
     }
+
     /**
      * @param $promise
      * @return self
@@ -24,20 +25,37 @@ class PromiseWrapper implements PromiseInterface
     {
         return new static($promise);
     }
+
     /**
      * Waits until the promise completes if possible.
      *
      * @return mixed
-     * @throws \LogicException if the promise has no wait function.
      */
     public function wait()
     {
-        if (!$this->objectHasMethod($this->wrappedPromise, 'wait')) {
-            throw new \LogicException('Promise does not implement "wait" method');
+        if ($this->objectHasMethod($this->getWrappedPromise(), 'wait')) {
+            return $this->getWrappedPromise()->wait();
+        }
+        $result = null;
+        /** @var \Exception|null $exception */
+        $exception = null;
+        $this->getWrappedPromise()->then(
+            function ($value) use (&$result) {
+                $result = $value;
+                return $value;
+            },
+            function ($reason) use (&$exception) {
+                $exception = $reason;
+                return $reason;
+            }
+        );
+        if (null !== $exception) {
+            throw $exception;
         }
 
-        return $this->wrappedPromise->wait();
+        return $result;
     }
+
     /**
      * Appends fulfillment and rejection handlers to the promise, and returns
      * a new promise resolving to the return value of the called handler.
